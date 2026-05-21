@@ -1,0 +1,6 @@
+artist,album,release_id,seller,ships_from,media_condition,item_price,shipping_price,currency,listing_url,seller_rating,seller_reviews
+Mock Artist A,Mock Album A,1001,uk_seller_one,United Kingdom,Near Mint (NM or M-),18.00,4.50,GBP,https://www.discogs.com/sell/item/111111,99.8,1200
+Mock Artist B,Mock Album B,1002,uk_seller_one,United Kingdom,Very Good Plus (VG+),12.00,4.50,GBP,https://www.discogs.com/sell/item/222222,99.8,1200
+Mock Artist A,Mock Album A,1003,uk_seller_two,United Kingdom,Mint (M),14.00,5.00,GBP,https://www.discogs.com/sell/item/333333,99.1,330
+Mock Artist B,Mock Album B,1004,uk_seller_three,United Kingdom,Near Mint (NM or M-),11.00,3.50,GBP,https://www.discogs.com/sell/item/444444,98.6,78
+

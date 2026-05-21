@@ -1,0 +1,10 @@
+[project]
+name = "discogs-vinyl-optimizer"
+version = "0.1.0"
+description = "Find UK Discogs vinyl candidates and optimise purchases from seller offers."
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
