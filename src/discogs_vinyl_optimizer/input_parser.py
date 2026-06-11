@@ -14,12 +14,20 @@ SUPPORTED_INPUT_EXTENSIONS = {".csv", ".txt", ".xlsx", ".docx"}
 KNOWN_ALBUM_CORRECTIONS = {
     ("dave brubeck", "time out"): ("The Dave Brubeck Quartet", "Time Out"),
     ("genesis", "nursery crime"): ("Genesis", "Nursery Cryme"),
+    ("smiths", "discography"): ("The Smiths", "Discography"),
+    ("beatles", "please please me"): ("The Beatles", "Please Please Me"),
+    ("beatles", "with the beatles"): ("The Beatles", "With The Beatles"),
+    ("beatles", "a hard day's night"): ("The Beatles", "A Hard Day's Night"),
+    ("beatles", "beatles for sale"): ("The Beatles", "Beatles For Sale"),
+    ("beatles", "rubber soul"): ("The Beatles", "Rubber Soul"),
+    ("beatles", "revolver"): ("The Beatles", "Revolver"),
+    ("beatles", "let it be"): ("The Beatles", "Let It Be"),
     ("the beatles", "sgt. peppers"): ("The Beatles", "Sgt. Pepper's Lonely Hearts Club Band"),
     ("keith jarrett", "the koln concert"): ("Keith Jarrett", "The Köln Concert"),
 }
 
 
-def albums_from_chat_text(text: str) -> list[AlbumRequest]:
+def albums_from_chat_text(text: str, apply_corrections: bool = True) -> list[AlbumRequest]:
     text = text.strip()
     if not text:
         raise ValueError("No album list provided.")
@@ -27,7 +35,8 @@ def albums_from_chat_text(text: str) -> list[AlbumRequest]:
         return _albums_from_csv_lines(text.splitlines(), source="chat CSV")
 
     albums: list[AlbumRequest] = []
-    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+    lines = _drop_optional_text_heading(text.splitlines())
+    for line_number, raw_line in lines:
         line = raw_line.strip()
         if not line:
             continue
@@ -37,26 +46,48 @@ def albums_from_chat_text(text: str) -> list[AlbumRequest]:
         albums.append(AlbumRequest(artist=match.group(1).strip(), album=match.group(2).strip()))
     if not albums:
         raise ValueError("No album rows found in pasted text.")
-    return apply_known_corrections(albums)
+    if apply_corrections:
+        return apply_known_corrections(albums)
+    return albums
 
 
-def albums_from_file(path: str | Path) -> list[AlbumRequest]:
+def _drop_optional_text_heading(lines: list[str]) -> list[tuple[int, str]]:
+    numbered = [(line_number, line) for line_number, line in enumerate(lines, start=1)]
+    non_empty = [(line_number, line) for line_number, line in numbered if line.strip()]
+    if len(non_empty) < 2:
+        return numbered
+
+    first_line_number, first_line = non_empty[0]
+    _, second_line = non_empty[1]
+    album_line_pattern = re.compile(r"^(.+?)\s+[-–—]\s+(.+)$")
+    if (
+        first_line_number == 1
+        and not album_line_pattern.match(first_line.strip())
+        and album_line_pattern.match(second_line.strip())
+    ):
+        return numbered[1:]
+    return numbered
+
+
+def albums_from_file(path: str | Path, apply_corrections: bool = True) -> list[AlbumRequest]:
     input_path = Path(path)
     if not input_path.exists():
         raise FileNotFoundError(f"Input file not found: {input_path}")
     suffix = input_path.suffix.casefold()
     if suffix == ".csv":
-        return apply_known_corrections(
-            _albums_from_csv_lines(input_path.read_text(encoding="utf-8-sig").splitlines(), source=str(input_path))
-        )
+        albums = _albums_from_csv_lines(input_path.read_text(encoding="utf-8-sig").splitlines(), source=str(input_path))
     if suffix == ".txt":
-        return apply_known_corrections(albums_from_chat_text(input_path.read_text(encoding="utf-8-sig")))
+        albums = albums_from_chat_text(input_path.read_text(encoding="utf-8-sig"), apply_corrections=False)
     if suffix == ".xlsx":
-        return apply_known_corrections(_albums_from_xlsx(input_path))
+        albums = _albums_from_xlsx(input_path)
     if suffix == ".docx":
-        return apply_known_corrections(albums_from_chat_text(_text_from_docx(input_path)))
-    allowed = ", ".join(sorted(SUPPORTED_INPUT_EXTENSIONS))
-    raise ValueError(f"Unsupported input file type '{suffix}'. Supported: {allowed}")
+        albums = albums_from_chat_text(_text_from_docx(input_path), apply_corrections=False)
+    if suffix not in SUPPORTED_INPUT_EXTENSIONS:
+        allowed = ", ".join(sorted(SUPPORTED_INPUT_EXTENSIONS))
+        raise ValueError(f"Unsupported input file type '{suffix}'. Supported: {allowed}")
+    if apply_corrections:
+        return apply_known_corrections(albums)
+    return albums
 
 
 def write_albums_csv(albums: list[AlbumRequest], path: str | Path) -> None:
@@ -78,13 +109,24 @@ def write_albums_csv(albums: list[AlbumRequest], path: str | Path) -> None:
 def apply_known_corrections(albums: list[AlbumRequest]) -> list[AlbumRequest]:
     corrected: list[AlbumRequest] = []
     for album in albums:
-        key = (_normalise_text(album.artist), _normalise_text(album.album))
-        if key in KNOWN_ALBUM_CORRECTIONS:
-            artist, title = KNOWN_ALBUM_CORRECTIONS[key]
-            corrected.append(AlbumRequest(artist=artist, album=title, release_id=album.release_id))
-        else:
-            corrected.append(album)
+        corrected.append(known_album_correction(album) or album)
     return corrected
+
+
+def known_album_correction(album: AlbumRequest) -> AlbumRequest | None:
+    key = (_normalise_text(album.artist), _normalise_text(album.album))
+    if key in KNOWN_ALBUM_CORRECTIONS:
+        artist, title = KNOWN_ALBUM_CORRECTIONS[key]
+    else:
+        artist, title = album.artist, _strip_trailing_year_annotation(album.album)
+    corrected = AlbumRequest(artist=artist, album=title, release_id=album.release_id)
+    if corrected == album:
+        return None
+    return corrected
+
+
+def _strip_trailing_year_annotation(value: str) -> str:
+    return re.sub(r"\s+\([^)]*\b\d{4}\b[^)]*\)\s*$", "", value).strip()
 
 
 def _looks_like_csv(text: str) -> bool:

@@ -49,7 +49,7 @@ def audit_purchase_outputs(
     coverage = _coverage_rows(albums, offers)
     for row in coverage:
         if row["offers"] == "0":
-            failures.append(f"No eligible scraped offers for {row['album']}.")
+            warnings.append(f"No eligible scraped offers for {row['album']}.")
 
     if not failures:
         checks.append("All arithmetic checks passed.")

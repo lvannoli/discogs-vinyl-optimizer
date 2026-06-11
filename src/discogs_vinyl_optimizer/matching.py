@@ -16,7 +16,7 @@ def title_matches_artist_album(title: str, artist: str, album: str) -> bool:
     row_artist, row_album = split_artist_album_display(title)
     if not row_artist or not row_album:
         return False
-    return normalise_match_text(row_artist) == normalise_match_text(artist) and normalise_match_text(
+    return normalise_artist_match_text(row_artist) == normalise_artist_match_text(artist) and normalise_match_text(
         strip_discogs_format_suffix(row_album)
     ) == normalise_match_text(album)
 
@@ -33,3 +33,10 @@ def normalise_match_text(value: str) -> str:
     without_punctuation = re.sub(r"[*'\u2019`]", "", without_punctuation)
     without_punctuation = re.sub(r"[^a-zA-Z0-9]+", " ", without_punctuation)
     return " ".join(without_punctuation.casefold().split())
+
+
+def normalise_artist_match_text(value: str) -> str:
+    normalised = normalise_match_text(value)
+    if normalised.startswith("the "):
+        return normalised[4:]
+    return normalised

@@ -16,6 +16,7 @@ def optimise_purchases(
     top_n: int = 5,
     max_offers_per_album: int = 50,
     beam_width: int = 5000,
+    allow_missing: bool = False,
 ) -> list[PurchaseOption]:
     if top_n < 1:
         raise ValueError("top_n must be at least 1")
@@ -40,11 +41,13 @@ def optimise_purchases(
         grouped[offer.album_key].append(offer)
 
     missing = [album.display for album in albums if album.key not in grouped]
-    if missing:
+    if missing and not allow_missing:
         raise OptimisationError("No eligible UK VG+/NM/M offers for: " + "; ".join(missing))
 
     groups: list[tuple[str, list[Offer]]] = []
     for album in albums:
+        if album.key not in grouped:
+            continue
         album_offers = sorted(
             grouped[album.key],
             key=lambda offer: (offer.single_item_total, offer.item_price, offer.shipping_price, offer.seller),

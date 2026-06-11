@@ -11,17 +11,30 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from discogs_vinyl_optimizer.input_parser import albums_from_chat_text, albums_from_file, write_albums_csv
-from discogs_vinyl_optimizer.catalog import search_releases
+from discogs_vinyl_optimizer.input_parser import (
+    albums_from_chat_text,
+    albums_from_file,
+    known_album_correction,
+    write_albums_csv,
+)
+from discogs_vinyl_optimizer.catalog import search_release_suggestions, search_releases
 from discogs_vinyl_optimizer.http_client import DiscogsClient, DiscogsHttpError
 from discogs_vinyl_optimizer.inventory_api import search_seller_inventory_offers
 from discogs_vinyl_optimizer.io import write_offers_csv
 from discogs_vinyl_optimizer.marketplace_scraper import ScrapeResult, scrape_marketplace_offers
-from discogs_vinyl_optimizer.matching import title_matches_artist_album
+from discogs_vinyl_optimizer.matching import (
+    normalise_artist_match_text,
+    normalise_match_text,
+    split_artist_album_display,
+    strip_discogs_format_suffix,
+    title_matches_artist_album,
+)
+from discogs_vinyl_optimizer.models import AlbumRequest
 from discogs_vinyl_optimizer.optimizer import OptimisationError, optimise_purchases
 from discogs_vinyl_optimizer.reports import write_options_html, write_options_json
 from discogs_vinyl_optimizer.audit import audit_purchase_outputs, write_audit_html, write_audit_json
 from discogs_vinyl_optimizer.seller_watchlist import read_seller_watchlist
+from discogs_vinyl_optimizer.spelling import SpellingSuggestion, suggest_album_correction
 from discogs_vinyl_optimizer.emailer import (
     DEFAULT_RESULTS_EMAIL,
     EmailError,
@@ -60,6 +73,7 @@ def main() -> int:
 
     try:
         albums = _load_albums(args.input_file, args.input_text)
+        albums = _confirm_spelling_corrections(albums, args)
         out_dir = Path(args.out_dir) if args.out_dir else ROOT / "outputs" / f"shortcut_{datetime.now():%Y%m%d_%H%M%S}"
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -118,14 +132,16 @@ def main() -> int:
         for warning in scrape_result.warnings:
             print(f"Warning: {warning}")
 
+        output_warnings = scrape_result.warnings + _missing_offer_warnings(albums, scrape_result.offers)
         options = optimise_purchases(
             albums=albums,
             offers=scrape_result.offers,
             top_n=args.top,
             max_offers_per_album=args.max_offers_per_album,
             beam_width=args.beam_width,
+            allow_missing=True,
         )
-        write_options_html(options, html_path, warnings=scrape_result.warnings)
+        write_options_html(options, html_path, warnings=output_warnings)
         write_options_json(options, json_path)
         audit = audit_purchase_outputs(albums_path, offers_path, json_path)
         write_audit_html(audit, audit_html_path)
@@ -172,14 +188,14 @@ def main() -> int:
 
 def _load_albums(input_file: str | None, input_text: str | None):
     if input_file:
-        return albums_from_file(input_file)
+        return albums_from_file(input_file, apply_corrections=False)
     if input_text:
-        return albums_from_chat_text(input_text)
+        return albums_from_chat_text(input_text, apply_corrections=False)
 
     first = input("Paste an album list or enter a CSV/XLSX/DOCX/TXT file path: ").strip().strip('"')
     possible_path = Path(first)
     if possible_path.exists():
-        return albums_from_file(possible_path)
+        return albums_from_file(possible_path, apply_corrections=False)
 
     lines = [first]
     print("Continue pasting album lines. Submit an empty line to start.")
@@ -188,13 +204,144 @@ def _load_albums(input_file: str | None, input_text: str | None):
         if not line.strip():
             break
         lines.append(line)
-    return albums_from_chat_text("\n".join(lines))
+    return albums_from_chat_text("\n".join(lines), apply_corrections=False)
 
 
 def _decimal(value: str):
     from decimal import Decimal
 
     return Decimal(value)
+
+
+def _confirm_spelling_corrections(albums, args):
+    client = DiscogsClient(
+        token=os.environ.get(args.token_env),
+        user_agent=args.user_agent,
+        min_delay_seconds=args.api_delay_seconds,
+    )
+    corrected_albums = []
+    for album in albums:
+        known = known_album_correction(album)
+        if known is not None:
+            print(f"Using corrected spelling: {known.display}")
+            corrected_albums.append(known)
+            continue
+        if album.release_id is not None:
+            corrected_albums.append(album)
+            continue
+        try:
+            found = search_releases(client, album, per_album=args.per_album)
+        except DiscogsHttpError as exc:
+            print(f"Warning: Spelling check skipped for {album.display}: {exc}")
+            corrected_albums.append(album)
+            continue
+        exact = [
+            candidate
+            for candidate in found
+            if title_matches_artist_album(candidate.title, album.artist, album.album)
+        ]
+        if exact:
+            corrected_albums.append(_candidate_album_correction(album, exact) or album)
+            continue
+        article_correction = _find_artist_article_correction(client, album, args)
+        if article_correction is not None:
+            print(f"Using corrected artist article: {article_correction.display}")
+            corrected_albums.append(article_correction)
+            continue
+        suggestion = _find_spelling_suggestion(client, album, args)
+        if suggestion is None:
+            corrected_albums.append(album)
+            continue
+        print(f"Using corrected spelling: {suggestion.corrected.display}")
+        corrected_albums.append(suggestion.corrected)
+    return corrected_albums
+
+
+def _find_artist_article_correction(client: DiscogsClient, album, args) -> AlbumRequest | None:
+    for variant in _artist_article_variants(album):
+        try:
+            found = search_releases(client, variant, per_album=args.per_album)
+        except DiscogsHttpError as exc:
+            print(f"Warning: Artist article check skipped for {variant.display}: {exc}")
+            continue
+        exact = [
+            candidate
+            for candidate in found
+            if title_matches_artist_album(candidate.title, variant.artist, variant.album)
+        ]
+        correction = _candidate_album_correction(album, exact)
+        if correction is not None:
+            return correction
+    return None
+
+
+def _artist_article_variants(album: AlbumRequest) -> list[AlbumRequest]:
+    artist = album.artist.strip()
+    if artist.casefold().startswith("the "):
+        return [AlbumRequest(artist=artist[4:].strip(), album=album.album, release_id=album.release_id)]
+    return [AlbumRequest(artist=f"The {artist}", album=album.album, release_id=album.release_id)]
+
+
+def _candidate_album_correction(album: AlbumRequest, candidates) -> AlbumRequest | None:
+    for candidate in candidates:
+        artist, title = split_artist_album_display(candidate.title)
+        title = strip_discogs_format_suffix(title)
+        if not artist or not title:
+            continue
+        if normalise_artist_match_text(artist) != normalise_artist_match_text(album.artist):
+            continue
+        if normalise_match_text(title) != normalise_match_text(album.album):
+            continue
+        corrected = AlbumRequest(
+            artist=_strip_discogs_artist_suffix(artist),
+            album=title,
+            release_id=album.release_id,
+        )
+        if corrected != album:
+            return corrected
+    return None
+
+
+def _strip_discogs_artist_suffix(value: str) -> str:
+    import re
+
+    without_numeric_suffix = re.sub(r"\s*\([0-9]+\)\s*$", "", value)
+    return without_numeric_suffix.replace("*", "").strip()
+
+
+def _find_spelling_suggestion(client: DiscogsClient, album, args) -> SpellingSuggestion | None:
+    try:
+        suggestions = search_release_suggestions(client, album, per_album=max(args.per_album, 10))
+    except DiscogsHttpError as exc:
+        print(f"Warning: Spelling suggestions skipped for {album.display}: {exc}")
+        return None
+    suggestion = suggest_album_correction(album, suggestions)
+    if suggestion is not None:
+        return suggestion
+    album_title_only = AlbumRequest(artist="", album=album.album, release_id=album.release_id)
+    try:
+        suggestions = search_release_suggestions(client, album_title_only, per_album=max(args.per_album, 50))
+    except DiscogsHttpError as exc:
+        print(f"Warning: Album-title spelling suggestions skipped for {album.display}: {exc}")
+        return None
+    return suggest_album_correction(album, suggestions)
+
+
+def _confirm_or_keep_spelling(suggestion: SpellingSuggestion):
+    prompt = (
+        f'Suggested corrected spelling for "{suggestion.original.display}": '
+        f'"{suggestion.corrected.display}". Apply this correction? [y/N]: '
+    )
+    try:
+        answer = input(prompt)
+    except EOFError:
+        print(f"No response received; keeping original spelling for {suggestion.original.display}.")
+        return suggestion.original
+    if answer.strip().casefold() in {"y", "yes"}:
+        print(f"Using corrected spelling: {suggestion.corrected.display}")
+        return suggestion.corrected
+    print(f"Keeping original spelling: {suggestion.original.display}")
+    return suggestion.original
 
 
 def _exact_release_candidates(albums, args):
@@ -221,6 +368,14 @@ def _exact_release_candidates(albums, args):
             continue
         candidates.extend(_dedupe_marketplace_candidates(exact)[: args.max_release_candidates])
     return candidates, warnings
+
+
+def _missing_offer_warnings(albums, offers):
+    covered = {offer.album_key for offer in offers}
+    missing = [album.display for album in albums if album.key not in covered]
+    if not missing:
+        return []
+    return ["No eligible UK VG+/NM/M offers found for: " + "; ".join(missing)]
 
 
 def _dedupe_marketplace_candidates(candidates):

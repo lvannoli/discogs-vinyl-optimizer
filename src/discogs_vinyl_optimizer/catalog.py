@@ -20,32 +20,19 @@ def search_releases(client: DiscogsClient, album: AlbumRequest, per_album: int =
         "per_page": per_album,
     }
     data = client.get_json("/database/search", params=params)
-    results = data.get("results", [])
-    candidates: list[ReleaseCandidate] = []
-    for result in results:
-        formats = result.get("format") or []
-        if "Vinyl" not in formats:
-            continue
-        release_id = result.get("id")
-        if release_id is None:
-            continue
-        candidates.append(
-            ReleaseCandidate(
-                album_key=album.key,
-                album_display=album.display,
-                release_id=int(release_id),
-                title=str(result.get("title", "")),
-                country=str(result.get("country", "")),
-                year=str(result.get("year", "")),
-                format_summary=", ".join(str(value) for value in formats),
-                uri=str(result.get("uri", "")),
-                resource_url=str(result.get("resource_url", "")),
-                want=_community_count(result, "want"),
-                have=_community_count(result, "have"),
-                master_id=_optional_int_value(result.get("master_id")),
-            )
-        )
-    return candidates
+    return _release_candidates_from_search_results(album, data.get("results", []))
+
+
+def search_release_suggestions(client: DiscogsClient, album: AlbumRequest, per_album: int = 10) -> list[ReleaseCandidate]:
+    query = " ".join(part.strip() for part in (album.artist, album.album) if part.strip())
+    params = {
+        "q": query,
+        "type": "release",
+        "format": "Vinyl",
+        "per_page": per_album,
+    }
+    data = client.get_json("/database/search", params=params)
+    return _release_candidates_from_search_results(album, data.get("results", []))
 
 
 def write_releases_csv(candidates: Iterable[ReleaseCandidate], path: str | Path) -> None:
@@ -151,6 +138,34 @@ def _release_from_id(client: DiscogsClient, album: AlbumRequest) -> ReleaseCandi
         have=None,
         master_id=_optional_int_value(data.get("master_id")),
     )
+
+
+def _release_candidates_from_search_results(album: AlbumRequest, results: Iterable[dict]) -> list[ReleaseCandidate]:
+    candidates: list[ReleaseCandidate] = []
+    for result in results:
+        formats = result.get("format") or []
+        if "Vinyl" not in formats:
+            continue
+        release_id = result.get("id")
+        if release_id is None:
+            continue
+        candidates.append(
+            ReleaseCandidate(
+                album_key=album.key,
+                album_display=album.display,
+                release_id=int(release_id),
+                title=str(result.get("title", "")),
+                country=str(result.get("country", "")),
+                year=str(result.get("year", "")),
+                format_summary=", ".join(str(value) for value in formats),
+                uri=str(result.get("uri", "")),
+                resource_url=str(result.get("resource_url", "")),
+                want=_community_count(result, "want"),
+                have=_community_count(result, "have"),
+                master_id=_optional_int_value(result.get("master_id")),
+            )
+        )
+    return candidates
 
 
 def _community_count(result: dict, key: str) -> int | None:

@@ -45,6 +45,20 @@ class OptimizerTests(unittest.TestCase):
         self.assertEqual(options[1].total, Decimal("34.50"))
         self.assertEqual([selected.seller for selected in options[1].offers], ["seller_one", "seller_one"])
 
+    def test_optimiser_can_build_partial_options_when_allowed(self):
+        albums = [
+            AlbumRequest("Artist A", "Album A"),
+            AlbumRequest("Artist B", "Album B"),
+        ]
+        offers = [
+            offer("Artist A", "Album A", "seller_one", "18.00", "4.50"),
+        ]
+
+        options = optimise_purchases(albums, offers, allow_missing=True)
+
+        self.assertEqual(len(options), 1)
+        self.assertEqual([selected.album for selected in options[0].offers], ["Album A"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -27,6 +27,10 @@ class MatchingTests(unittest.TestCase):
             )
         )
 
+    def test_title_matches_artist_with_optional_the(self):
+        self.assertTrue(title_matches_artist_album("The Beatles - Revolver", "Beatles", "Revolver"))
+        self.assertTrue(title_matches_artist_album("Beatles - Revolver", "The Beatles", "Revolver"))
+
     def test_title_rejects_wrong_artist_or_album(self):
         self.assertFalse(
             title_matches_artist_album(
