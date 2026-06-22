@@ -19,7 +19,7 @@ from discogs_vinyl_optimizer.input_parser import (
 )
 from discogs_vinyl_optimizer.catalog import search_release_suggestions, search_releases
 from discogs_vinyl_optimizer.http_client import DiscogsClient, DiscogsHttpError
-from discogs_vinyl_optimizer.inventory_api import search_seller_inventory_offers
+from discogs_vinyl_optimizer.inventory_api import InventorySearchProgress, search_seller_inventory_offers
 from discogs_vinyl_optimizer.io import write_offers_csv
 from discogs_vinyl_optimizer.marketplace_scraper import ScrapeResult, scrape_marketplace_offers
 from discogs_vinyl_optimizer.matching import (
@@ -99,6 +99,8 @@ def main() -> int:
             )
             if not sellers:
                 raise ValueError("No sellers matched the watchlist thresholds.")
+            checkpoint_path = out_dir / "inventory_checkpoint.json"
+            print(f"Inventory checkpoint: {checkpoint_path}")
             scrape_result = search_seller_inventory_offers(
                 client=DiscogsClient(
                     token=token,
@@ -110,6 +112,8 @@ def main() -> int:
                 per_query=args.per_query,
                 max_pages_per_query=args.max_pages_per_query,
                 catalog_per_album=args.per_album,
+                checkpoint_path=checkpoint_path,
+                progress_callback=_print_inventory_progress,
             )
             print(f"Queried {len(sellers)} seller(s) from {args.seller_watchlist}.")
         else:
@@ -211,6 +215,26 @@ def _decimal(value: str):
     from decimal import Decimal
 
     return Decimal(value)
+
+
+def _print_inventory_progress(progress: InventorySearchProgress) -> None:
+    action = "Skipped" if progress.skipped else "Completed"
+    seller_delta = "" if progress.skipped else f", +{progress.seller_offers} offer(s)"
+    print(
+        f"{action} seller {progress.current_seller}/{progress.total_sellers}: "
+        f"{progress.seller}{seller_delta}, {progress.total_offers} total offer(s), "
+        f"{progress.warnings} warning(s), elapsed {_format_duration(progress.elapsed_seconds)}",
+        flush=True,
+    )
+
+
+def _format_duration(seconds: float) -> str:
+    total_seconds = int(seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    return f"{minutes}m{seconds:02d}s"
 
 
 def _confirm_spelling_corrections(albums, args):

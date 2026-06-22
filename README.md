@@ -223,6 +223,8 @@ python .\run.py audit --albums .\outputs\my_run\albums.csv --offers .\outputs\my
 
 The `api-sellers` mode still exists for experiments with seller inventory endpoints, but it is not the recommended workflow. It is slower and requires a seller watchlist plus a Discogs user token.
 
+Long `api-sellers` runs write `inventory_checkpoint.json` inside the output directory and print seller-by-seller progress. If a run is interrupted, rerun the same command with the same `--out-dir` to resume completed sellers from the checkpoint.
+
 ## Token Configuration
 
 Optional:

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import json
 import re
+import time
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from typing import Iterable
+from pathlib import Path
+from typing import Any, Callable, Iterable
 from urllib.parse import quote
 
 from .catalog import search_releases
@@ -17,6 +21,19 @@ from .seller_watchlist import SellerWatchlistEntry
 class InventorySearchResult:
     offers: list[Offer]
     warnings: list[str]
+
+
+@dataclass(frozen=True)
+class InventorySearchProgress:
+    current_seller: int
+    total_sellers: int
+    seller: str
+    seller_offers: int
+    total_offers: int
+    warnings: int
+    elapsed_seconds: float
+    skipped: bool = False
+    checkpoint_path: str | None = None
 
 
 ARTIST_FILLER_TOKENS = {
@@ -39,6 +56,8 @@ def search_seller_inventory_offers(
     per_query: int = 10,
     max_pages_per_query: int = 1,
     catalog_per_album: int = 25,
+    checkpoint_path: str | Path | None = None,
+    progress_callback: Callable[[InventorySearchProgress], None] | None = None,
 ) -> InventorySearchResult:
     if per_query < 1 or per_query > 100:
         raise ValueError("per_query must be between 1 and 100")
@@ -47,12 +66,57 @@ def search_seller_inventory_offers(
     if catalog_per_album < 0:
         raise ValueError("catalog_per_album cannot be negative")
 
-    candidate_ids, candidate_warnings = _candidate_release_ids(client, albums, catalog_per_album)
-    offers: list[Offer] = []
-    warnings = list(candidate_warnings)
+    sellers_list = list(sellers)
+    started_at = time.monotonic()
+    checkpoint = _load_checkpoint(
+        checkpoint_path,
+        signature=_checkpoint_signature(
+            albums=albums,
+            sellers=sellers_list,
+            per_query=per_query,
+            max_pages_per_query=max_pages_per_query,
+            catalog_per_album=catalog_per_album,
+        ),
+    )
+    candidate_ids = checkpoint.candidate_ids
+    offers = checkpoint.offers
+    warnings = checkpoint.warnings
+    completed_sellers = set(checkpoint.completed_sellers)
     seen: set[tuple[str, str]] = set()
+    for offer in offers:
+        seen.add((offer.album_key, offer.listing_id or offer.listing_url))
 
-    for seller in sellers:
+    if not candidate_ids:
+        candidate_ids, candidate_warnings = _candidate_release_ids(client, albums, catalog_per_album)
+        warnings.extend(candidate_warnings)
+        _write_checkpoint(
+            checkpoint_path,
+            signature=checkpoint.signature,
+            candidate_ids=candidate_ids,
+            offers=offers,
+            warnings=warnings,
+            completed_sellers=completed_sellers,
+        )
+
+    total_sellers = len(sellers_list)
+    for seller_index, seller in enumerate(sellers_list, start=1):
+        if seller.username in completed_sellers:
+            if progress_callback is not None:
+                progress_callback(
+                    InventorySearchProgress(
+                        current_seller=seller_index,
+                        total_sellers=total_sellers,
+                        seller=seller.username,
+                        seller_offers=0,
+                        total_offers=len(offers),
+                        warnings=len(warnings),
+                        elapsed_seconds=time.monotonic() - started_at,
+                        skipped=True,
+                        checkpoint_path=str(checkpoint_path) if checkpoint_path is not None else None,
+                    )
+                )
+            continue
+        seller_offer_count = 0
         for album in albums:
             query = _inventory_query(album)
             for page in range(1, max_pages_per_query + 1):
@@ -84,8 +148,161 @@ def search_seller_inventory_offers(
                         continue
                     seen.add(key)
                     offers.append(offer)
+                    seller_offer_count += 1
 
+        completed_sellers.add(seller.username)
+        _write_checkpoint(
+            checkpoint_path,
+            signature=checkpoint.signature,
+            candidate_ids=candidate_ids,
+            offers=offers,
+            warnings=warnings,
+            completed_sellers=completed_sellers,
+        )
+        if progress_callback is not None:
+            progress_callback(
+                InventorySearchProgress(
+                    current_seller=seller_index,
+                    total_sellers=total_sellers,
+                    seller=seller.username,
+                    seller_offers=seller_offer_count,
+                    total_offers=len(offers),
+                    warnings=len(warnings),
+                    elapsed_seconds=time.monotonic() - started_at,
+                    checkpoint_path=str(checkpoint_path) if checkpoint_path is not None else None,
+                )
+            )
     return InventorySearchResult(offers=_sort_offers(offers), warnings=warnings)
+
+
+@dataclass(frozen=True)
+class _InventoryCheckpoint:
+    signature: dict[str, object]
+    candidate_ids: dict[str, set[int]]
+    offers: list[Offer]
+    warnings: list[str]
+    completed_sellers: set[str]
+
+
+def _checkpoint_signature(
+    albums: list[AlbumRequest],
+    sellers: list[SellerWatchlistEntry],
+    per_query: int,
+    max_pages_per_query: int,
+    catalog_per_album: int,
+) -> dict[str, object]:
+    return {
+        "album_keys": [album.key for album in albums],
+        "seller_usernames": [seller.username for seller in sellers],
+        "per_query": per_query,
+        "max_pages_per_query": max_pages_per_query,
+        "catalog_per_album": catalog_per_album,
+    }
+
+
+def _load_checkpoint(path: str | Path | None, signature: dict[str, object]) -> _InventoryCheckpoint:
+    if path is None:
+        return _InventoryCheckpoint(
+            signature=signature,
+            candidate_ids={},
+            offers=[],
+            warnings=[],
+            completed_sellers=set(),
+        )
+    checkpoint_path = Path(path)
+    if not checkpoint_path.exists():
+        return _InventoryCheckpoint(
+            signature=signature,
+            candidate_ids={},
+            offers=[],
+            warnings=[],
+            completed_sellers=set(),
+        )
+    data = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    if data.get("signature") != signature:
+        raise ValueError(
+            f"Checkpoint {checkpoint_path} does not match the current album/seller search. "
+            "Use a different --out-dir or remove the checkpoint file."
+        )
+    candidate_ids = {
+        str(album_key): {int(release_id) for release_id in release_ids}
+        for album_key, release_ids in (data.get("candidate_ids") or {}).items()
+    }
+    return _InventoryCheckpoint(
+        signature=signature,
+        candidate_ids=candidate_ids,
+        offers=[_offer_from_checkpoint(row) for row in data.get("offers", [])],
+        warnings=[str(warning) for warning in data.get("warnings", [])],
+        completed_sellers={str(seller) for seller in data.get("completed_sellers", [])},
+    )
+
+
+def _write_checkpoint(
+    path: str | Path | None,
+    signature: dict[str, object],
+    candidate_ids: dict[str, set[int]],
+    offers: list[Offer],
+    warnings: list[str],
+    completed_sellers: set[str],
+) -> None:
+    if path is None:
+        return
+    checkpoint_path = Path(path)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    data = {
+        "version": 1,
+        "updated_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "signature": signature,
+        "candidate_ids": {
+            album_key: sorted(release_ids)
+            for album_key, release_ids in sorted(candidate_ids.items())
+        },
+        "completed_sellers": sorted(completed_sellers),
+        "warnings": warnings,
+        "offers": [_offer_to_checkpoint(offer) for offer in _sort_offers(offers)],
+    }
+    temp_path = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
+    temp_path.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    temp_path.replace(checkpoint_path)
+
+
+def _offer_to_checkpoint(offer: Offer) -> dict[str, object]:
+    return {
+        "artist": offer.artist,
+        "album": offer.album,
+        "seller": offer.seller,
+        "ships_from": offer.ships_from,
+        "media_condition": offer.media_condition,
+        "item_price": str(offer.item_price),
+        "shipping_price": str(offer.shipping_price),
+        "currency": offer.currency,
+        "listing_url": offer.listing_url,
+        "release_id": offer.release_id,
+        "listing_id": offer.listing_id,
+        "seller_rating": str(offer.seller_rating) if offer.seller_rating is not None else None,
+        "seller_reviews": offer.seller_reviews,
+        "source": offer.source or {},
+    }
+
+
+def _offer_from_checkpoint(row: dict[str, Any]) -> Offer:
+    seller_rating = row.get("seller_rating")
+    return Offer(
+        artist=str(row["artist"]),
+        album=str(row["album"]),
+        seller=str(row["seller"]),
+        ships_from=str(row["ships_from"]),
+        media_condition=str(row["media_condition"]),
+        item_price=Decimal(str(row["item_price"])).quantize(Decimal("0.01")),
+        shipping_price=Decimal(str(row["shipping_price"])).quantize(Decimal("0.01")),
+        currency=str(row["currency"]),
+        listing_url=str(row["listing_url"]),
+        release_id=_int_or_none(row.get("release_id")),
+        listing_id=str(row["listing_id"]) if row.get("listing_id") else None,
+        seller_rating=Decimal(str(seller_rating)).quantize(Decimal("0.01")) if seller_rating is not None else None,
+        seller_reviews=_int_or_none(row.get("seller_reviews")),
+        source=dict(row.get("source") or {}),
+    )
 
 
 def refresh_seller_watchlist_entries(

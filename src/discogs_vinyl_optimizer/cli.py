@@ -8,7 +8,7 @@ from pathlib import Path
 from .catalog import read_releases_csv, search_releases, write_releases_csv
 from .env import load_env_file
 from .http_client import DiscogsClient, DiscogsHttpError
-from .inventory_api import refresh_seller_watchlist_entries, search_seller_inventory_offers
+from .inventory_api import InventorySearchProgress, refresh_seller_watchlist_entries, search_seller_inventory_offers
 from .io import read_albums, read_offers, write_marketplace_links_html, write_offers_csv, write_offers_template_csv
 from .marketplace import marketplace_rows
 from .marketplace_scraper import merge_scrape_results, scrape_marketplace_offers, scrape_marketplace_search_offers
@@ -337,6 +337,9 @@ def run_api_sellers(args: argparse.Namespace) -> int:
     if not sellers:
         raise ValueError("No sellers matched the watchlist thresholds.")
 
+    out_dir = Path(args.out_dir)
+    checkpoint_path = out_dir / "inventory_checkpoint.json"
+    print(f"Inventory checkpoint: {checkpoint_path}")
     client = make_client(args)
     result = search_seller_inventory_offers(
         client=client,
@@ -345,9 +348,10 @@ def run_api_sellers(args: argparse.Namespace) -> int:
         per_query=args.per_query,
         max_pages_per_query=args.max_pages_per_query,
         catalog_per_album=args.per_album,
+        checkpoint_path=checkpoint_path,
+        progress_callback=print_inventory_progress,
     )
 
-    out_dir = Path(args.out_dir)
     offers_path = out_dir / "offers_api.csv"
     write_offers_csv(result.offers, offers_path)
     print(f"Wrote {offers_path}")
@@ -436,3 +440,23 @@ def run_audit(args: argparse.Namespace) -> int:
 def make_client(args: argparse.Namespace) -> DiscogsClient:
     token = os.environ.get(args.token_env)
     return DiscogsClient(token=token, user_agent=args.user_agent, min_delay_seconds=args.api_delay_seconds)
+
+
+def print_inventory_progress(progress: InventorySearchProgress) -> None:
+    action = "Skipped" if progress.skipped else "Completed"
+    seller_delta = "" if progress.skipped else f", +{progress.seller_offers} offer(s)"
+    print(
+        f"{action} seller {progress.current_seller}/{progress.total_sellers}: "
+        f"{progress.seller}{seller_delta}, {progress.total_offers} total offer(s), "
+        f"{progress.warnings} warning(s), elapsed {format_duration(progress.elapsed_seconds)}",
+        flush=True,
+    )
+
+
+def format_duration(seconds: float) -> str:
+    total_seconds = int(seconds)
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{seconds:02d}s"
+    return f"{minutes}m{seconds:02d}s"
